@@ -129,8 +129,9 @@ hopfield = StorkeyHopfield(
 ```
 E_total = E_pc + hopfield_strength * E_hop
 E_pc   = 0.5 ||z - mu||^2  (or user-specified energy)
-E_hop  = (1/2D) z^T (W^2 - W) z
+E_hop  = (1/2D) (||W^T z||^2 - z^T W z)   # summed over every non-batch axis -> (batch,)
 ```
+For the default symmetric `W` this equals `(1/2D) z^T (W^2 - W) z`; with `enforce_symmetry=False` the two differ and the node implements the `||W^T z||^2` form, whose latent gradient is `(s/D)(W W^T - (W + W^T)/2) z`.
 
 **Prediction:**
 ```
