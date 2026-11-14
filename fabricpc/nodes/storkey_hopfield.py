@@ -199,6 +199,10 @@ class StorkeyHopfield(NodeBase):
         hopfield_strength: Scaling of E_hop relative to E_pc.
             If None (default), a learnable scalar initialized to 1.0.
             If a float, fixed at that value.
+        max_strength: Optional cap on the learnable strength. If set, the
+            effective strength is max_strength * sigmoid(raw), initialized to
+            1.0. Must lie in (1, 4 * D * precision) so the latent energy stays
+            convex for every W. Only valid with hopfield_strength=None.
         use_bias: Whether to include bias (default: False).
         enforce_symmetry: Symmetrize W via 0.5*(W+W.T) in forward (default: True).
         zero_diagonal: Zero W diagonal in forward (default: False).
@@ -220,7 +224,28 @@ class StorkeyHopfield(NodeBase):
         latent_init: InitializerBase = NormalInitializer(),
         weight_init: InitializerBase = XavierInitializer(),
         bias_init: InitializerBase = ZerosInitializer(),
+        max_strength: Optional[float] = None,
     ):
+        if max_strength is not None:
+            if hopfield_strength is not None:
+                raise ValueError(
+                    "max_strength caps the learnable strength; it cannot be "
+                    "combined with a fixed hopfield_strength."
+                )
+            if max_strength <= 1.0:
+                raise ValueError(
+                    "max_strength must exceed 1.0, the initial learnable strength."
+                )
+            if isinstance(energy, GaussianEnergy):
+                limit = convex_strength_limit(
+                    shape[-1], energy.config.get("precision", 1.0)
+                )
+                if max_strength >= limit:
+                    raise ValueError(
+                        f"max_strength={max_strength} must be below "
+                        f"4 * D * precision = {limit} to keep the latent "
+                        "energy convex. See convex_strength_limit."
+                    )
         if hopfield_strength is not None and isinstance(energy, GaussianEnergy):
             limit = convex_strength_limit(
                 shape[-1], energy.config.get("precision", 1.0)
@@ -242,6 +267,7 @@ class StorkeyHopfield(NodeBase):
             weight_init=weight_init,
             bias_init=bias_init,
             hopfield_strength=hopfield_strength,
+            max_strength=max_strength,
             use_bias=use_bias,
             enforce_symmetry=enforce_symmetry,
             zero_diagonal=zero_diagonal,
@@ -348,9 +374,29 @@ class StorkeyHopfield(NodeBase):
         # Init raw so that softplus(raw) = 1.0
         hopfield_strength = config["hopfield_strength"]
         if hopfield_strength is None:
-            biases["hopfield_strength"] = inverse_softplus(jnp.array(1.0))
+            cap = config.get("max_strength")
+            if cap is None:
+                biases["hopfield_strength"] = inverse_softplus(jnp.array(1.0))
+            else:
+                # logit(1 / cap), so cap * sigmoid(raw) = 1.0 at init
+                biases["hopfield_strength"] = jnp.log(jnp.array(1.0 / (cap - 1.0)))
 
         return NodeParams(weights=weights_dict, biases=biases)
+
+    @staticmethod
+    def effective_strength(params: NodeParams, config: Dict[str, Any]) -> jax.Array:
+        """Strength s used in predict() and energy().
+
+        Fixed: the configured float. Learnable: softplus(raw), or
+        max_strength * sigmoid(raw) when a cap is set.
+        """
+        if "hopfield_strength" not in params.biases:
+            return config["hopfield_strength"]
+        raw = params.biases["hopfield_strength"]
+        cap = config.get("max_strength")
+        if cap is None:
+            return jax.nn.softplus(raw)
+        return cap * jax.nn.sigmoid(raw)
 
     @staticmethod
     def _prepare_W(W: jnp.ndarray, config: Dict[str, Any]) -> jnp.ndarray:
@@ -393,11 +439,7 @@ class StorkeyHopfield(NodeBase):
         # Symmetrize the weights
         W = StorkeyHopfield._prepare_W(params.weights[edge_key], config)
 
-        # Learnable strength is stored raw; softplus keeps the effective value >= 0.
-        if "hopfield_strength" in params.biases:
-            strength = jax.nn.softplus(params.biases["hopfield_strength"])
-        else:
-            strength = config["hopfield_strength"]
+        strength = StorkeyHopfield.effective_strength(params, config)
 
         # Strength-weighted blend: probe/(1+s) + (probe @ W)*s/(1+s).
         # The probe residual carries the information pathway while

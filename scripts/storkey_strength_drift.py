@@ -6,6 +6,7 @@ floor 1 + (s / D) * min eig(W^2 - W), which is negative once s > 4 D.
 
     python scripts/storkey_strength_drift.py --steps 14000
     python scripts/storkey_strength_drift.py --steps 4000 --stop-grad
+    python scripts/storkey_strength_drift.py --steps 14000 --cap 100
 """
 
 import argparse
@@ -50,13 +51,14 @@ def main():
     ap.add_argument("--steps", type=int, default=4000)
     ap.add_argument("--lr", type=float, default=1e-2)
     ap.add_argument("--stop-grad", action="store_true")
+    ap.add_argument("--cap", type=float, default=None)
     args = ap.parse_args()
     if args.stop_grad:
         freeze_strength_in_hopfield_term()
 
     x_node = IdentityNode(shape=(IN,), name="input")
     hidden = Linear(shape=(D,), activation=SigmoidActivation(), name="hidden")
-    hop = StorkeyHopfield(shape=(D,), name="hopfield")
+    hop = StorkeyHopfield(shape=(D,), name="hopfield", max_strength=args.cap)
     out = Linear(
         shape=(CLASSES,),
         activation=SoftmaxActivation(),
@@ -90,8 +92,9 @@ def main():
         batch = {"x": x, "y": jax.nn.one_hot(y, CLASSES)}
         params, opt_state, metrics, _ = step(params, opt_state, batch, k_step)
         if i % every == 0:
-            raw = params.nodes["hopfield"].biases["hopfield_strength"]
-            s = float(jax.nn.softplus(raw))
+            cfg = {"hopfield_strength": None, "max_strength": args.cap}
+            node_params = params.nodes["hopfield"]
+            s = float(StorkeyHopfield.effective_strength(node_params, cfg))
             W = np.asarray(params.nodes["hopfield"].weights[edge])
             eig = np.linalg.eigvalsh(0.5 * (W + W.T))
             floor = 1 + s / D * (eig**2 - eig).min()
