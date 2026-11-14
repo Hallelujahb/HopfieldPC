@@ -118,6 +118,7 @@ Recurrency comes from the Hopfield energy gradient during inference steps.
 
 from __future__ import annotations
 
+import warnings
 from typing import Dict, Any, Optional, Tuple, TYPE_CHECKING
 import jax
 import jax.numpy as jnp
@@ -148,6 +149,28 @@ def inverse_softplus(x: jax.Array) -> jax.Array:
     `jax.nn.softplus(raw)` equals a desired positive target value.
     """
     return jnp.log(jnp.expm1(x))
+
+
+def convex_strength_limit(dim: int, precision: float = 1.0) -> float:
+    """Strength at which the latent energy stops being convex for some W.
+
+    With a Gaussian PC term of the given precision p, the Hessian of
+    E_pc + s * E_hop with respect to z is
+
+        p I + (s / D) (W W^T - (W + W^T) / 2).
+
+    For any z, z^T (W W^T - (W + W^T) / 2) z = |W^T z|^2 - z^T W^T z is at
+    least -|z|^2 / 4 (minimize x^2 - |z| x over x = |W^T z|), so the Hessian is
+    bounded below by (p - s / (4 D)) I whatever W is. The bound is attained at
+    W = I / 2. The energy is therefore convex in z for every W when
+    s < 4 D p, and for W = I / 2 it is not convex at s > 4 D p: there it is
+    unbounded below in z and gradient-descent inference diverges along the
+    attractor direction.
+
+    Returns:
+        4 * dim * precision.
+    """
+    return 4.0 * dim * precision
 
 
 class StorkeyHopfield(NodeBase):
@@ -198,6 +221,18 @@ class StorkeyHopfield(NodeBase):
         weight_init: InitializerBase = XavierInitializer(),
         bias_init: InitializerBase = ZerosInitializer(),
     ):
+        if hopfield_strength is not None and isinstance(energy, GaussianEnergy):
+            limit = convex_strength_limit(
+                shape[-1], energy.config.get("precision", 1.0)
+            )
+            if hopfield_strength >= limit:
+                warnings.warn(
+                    f"hopfield_strength={hopfield_strength} is at or above "
+                    f"4 * D * precision = {limit}; the latent energy is "
+                    "non-convex for some W, so inference can diverge. See "
+                    "convex_strength_limit.",
+                    stacklevel=2,
+                )
         super().__init__(
             shape=shape,
             name=name,
