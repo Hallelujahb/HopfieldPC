@@ -1,5 +1,8 @@
 """Tests for StorkeyHopfield associative memory node."""
 
+from contextlib import contextmanager
+from types import SimpleNamespace
+
 import pytest
 import jax
 import jax.numpy as jnp
@@ -12,7 +15,8 @@ from fabricpc.graph_initialization.state_initializer import initialize_graph_sta
 from fabricpc.core.learning import compute_local_weight_gradients
 from fabricpc.core.inference import InferenceSGD, run_inference
 from fabricpc.core.activations import SigmoidActivation, SoftmaxActivation
-from fabricpc.core.energy import CrossEntropyEnergy
+from fabricpc.core.energy import CrossEntropyEnergy, GaussianEnergy
+from fabricpc.core.types import NodeState
 from fabricpc.core.initializers import XavierInitializer, NormalInitializer
 from fabricpc.training import make_train_step
 from conftest import with_inference
@@ -103,7 +107,7 @@ class TestEnergy:
 
     def test_attractor_energy_formula(self, rng_key):
         """Value-pin the attractor term: energy() minus the base PC term
-        equals s * (1/2D) z^T (W^2 - W) z computed independently, where W is
+        equals s * (1/2D) (z^T W W^T z - z^T W z) computed independently, where W is
         the prepared (symmetrized) weight matrix and s the effective
         (softplus'd) strength."""
         D = 8
@@ -134,9 +138,11 @@ class TestEnergy:
         edge_key = info.in_edges[0]
         W = StorkeyHopfield._prepare_W(hop_params.weights[edge_key], info.node_config)
         s = jax.nn.softplus(hop_params.biases["hopfield_strength"])
-        # (1/2D) z^T (W^2 - W) z, written as its quadratic forms.
+        # (1/2D) (z^T W W^T z - z^T W z), written as its quadratic forms.
+        # For the default symmetric W this is the documented (W^2 - W) form;
+        # TestEnergyShapeAndGradient covers the non-symmetric case.
         expected_attractor = (0.5 / D) * (
-            jnp.einsum("bi,ij,jk,bk->b", z, W, W, z)
+            jnp.einsum("bi,ij,kj,bk->b", z, W, W, z)
             - jnp.einsum("bi,ij,bj->b", z, W, z)
         )
         assert jnp.allclose(
@@ -190,6 +196,114 @@ class TestEnergy:
         assert (
             energy_many <= energy_few + 1e-3
         ), f"Energy did not decrease: {energy_few} -> {energy_many}"
+
+
+# =========================================================================
+# Energy shape / reduction / analytic-gradient tests (direct energy() calls)
+# =========================================================================
+
+
+@contextmanager
+def _x64():
+    """Scoped float64 so enabling x64 cannot leak into other tests.
+
+    Uses the same ``jax.config.update("jax_enable_x64", ...)`` toggle (restored
+    in ``finally``) as the repo's other float64 tests, which works on every
+    supported JAX version.
+    """
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", False)
+
+
+def _energy_call(z, z_mu, W, strength):
+    """Call StorkeyHopfield.energy() directly, bypassing graph assembly.
+
+    energy() only needs node_info.energy (base PC term), state.z_latent/z_mu
+    and aux=(W, strength), so a stand-in node_info keeps these tests about the
+    energy contract alone and lets us use latent shapes such as (batch, T, D).
+    """
+    node_info = SimpleNamespace(energy=GaussianEnergy())
+    state = NodeState(
+        z_latent=z,
+        z_mu=z_mu,
+        error=z - z_mu,
+        energy=jnp.zeros((z.shape[0],), dtype=z.dtype),
+        latent_grad=jnp.zeros_like(z),
+    )
+    return StorkeyHopfield.energy(None, {}, state, (W, strength), node_info)
+
+
+class TestEnergyShapeAndGradient:
+    """energy() must return (batch,) and its autodiff gradient must match the
+    documented analytic form, for symmetric and non-symmetric W."""
+
+    D = 6
+
+    @pytest.mark.parametrize(
+        "shape",
+        [(3, 6), (3, 4, 6), (4, 4, 6), (1, 4, 6)],
+        ids=["B,D", "B,T,D (B!=T)", "B,T,D (B==T)", "B==1,T,D"],
+    )
+    def test_energy_is_per_sample(self, rng_key, shape):
+        """Regression: energy summed over axis=-1 only, so (B, T, D) latents
+        returned (B, T) and broke the (batch,) contract (crashing the
+        inference scan)."""
+        k1, k2, k3 = jax.random.split(rng_key, 3)
+        W = jax.random.normal(k1, (self.D, self.D))
+        z = jax.random.normal(k2, shape)
+        mu = jax.random.normal(k3, shape)
+        e = _energy_call(z, mu, W, strength=0.7)
+        assert e.shape == (shape[0],)
+
+    def test_hopfield_term_sums_over_sequence_axis(self, rng_key):
+        """With z_mu == z the PC term vanishes, so the energy of a (B, T, D)
+        latent must equal the sum of the (B, D) energies of its T slices."""
+        B, T, D = 3, 4, self.D
+        k1, k2 = jax.random.split(rng_key)
+        W = jax.random.normal(k1, (D, D))
+        z = jax.random.normal(k2, (B, T, D))
+        full = _energy_call(z, z, W, strength=1.3)
+        per_slice = sum(
+            _energy_call(z[:, t, :], z[:, t, :], W, strength=1.3) for t in range(T)
+        )
+        assert jnp.allclose(full, per_slice, atol=1e-5)
+
+    @pytest.mark.parametrize("symmetric", [True, False], ids=["sym", "nonsym"])
+    @pytest.mark.parametrize("shape", [(3, 6), (3, 4, 6)], ids=["B,D", "B,T,D"])
+    def test_latent_gradient_matches_analytic_float64(self, rng_key, symmetric, shape):
+        """d(sum E)/dz == (z - mu) + (s/D) * (W W^T - (W + W^T)/2) z, in float64.
+
+        For symmetric W the Hopfield part is the documented (s/D)(W^2 - W) z.
+        For non-symmetric W (enforce_symmetry=False) the two differ; this pins
+        the form the code actually implements.
+        """
+        D = self.D
+        strength = 0.9
+        with _x64():
+            k1, k2, k3 = jax.random.split(rng_key, 3)
+            W_raw = jax.random.normal(k1, (D, D), dtype=jnp.float64)
+            W = StorkeyHopfield._prepare_W(
+                W_raw, {"enforce_symmetry": symmetric, "zero_diagonal": False}
+            )
+            z = jax.random.normal(k2, shape, dtype=jnp.float64)
+            mu = jax.random.normal(k3, shape, dtype=jnp.float64)
+
+            grad = jax.grad(lambda z_: jnp.sum(_energy_call(z_, mu, W, strength)))(z)
+
+            sym_W = 0.5 * (W + W.T)
+            analytic = (z - mu) + (strength / D) * ((z @ W) @ W.T - z @ sym_W)
+            assert grad.dtype == jnp.float64
+            assert jnp.allclose(grad, analytic, atol=1e-10, rtol=1e-10)
+
+            if symmetric:
+                documented = (z - mu) + (strength / D) * (z @ W @ W - z @ W)
+                assert jnp.allclose(grad, documented, atol=1e-10, rtol=1e-10)
+            else:
+                documented = (z - mu) + (strength / D) * (z @ W @ W - z @ W)
+                assert not jnp.allclose(grad, documented, atol=1e-6)
 
 
 # =========================================================================

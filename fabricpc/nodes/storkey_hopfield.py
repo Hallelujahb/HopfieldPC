@@ -13,9 +13,13 @@ Energy formulation:
     E_total = E_pc + hopfield_strength * E_hop
 
     E_pc = 0.5 ||z - mu||^2              (Gaussian, or user-specified)
-    E_hop = (1/2D) z^T (W^2 - W) z       (Hopfield attractor energy)
+    E_hop = (1/2D) (||W^T z||^2 - z^T W z)   (Hopfield attractor energy)
 
-    where D = dimension of z (last axis) for scale-invariance.
+    where D = dimension of z (last axis) for scale-invariance, and E_hop is
+    summed over every non-batch axis so the node energy has shape (batch,).
+    For the default symmetric W this equals (1/2D) z^T (W^2 - W) z; for a
+    non-symmetric W (enforce_symmetry=False) the two differ, and the code
+    implements the ||W^T z||^2 form (see the gradient expression below).
 
 The node implements the split contract: ``predict()`` returns z_mu plus the
 aux pair (W, strength), and the ``energy()`` override adds the Hopfield
@@ -23,7 +27,8 @@ attractor term to the base PC energy. The gradient dE_hop/dz is computed
 automatically via autodiff in forward_and_latent_grads().
 
 Attractor dynamics arise naturally from the Hopfield energy gradient
-(strength/D)(W^2 - W)z, which is accumulated to latent_grad and applied
+(strength/D)(W W^T - (W + W^T)/2) z, which equals (strength/D)(W^2 - W) z for
+symmetric W. The gradient is accumulated to latent_grad and applied
 during PC inference (z -= eta * latent_grad). Since PC inference IS gradient
 descent on E_total, the inference loop itself iterates z toward the
 attractors encoded in W.
@@ -467,14 +472,19 @@ class StorkeyHopfield(NodeBase):
     ) -> jnp.ndarray:
         """Combined energy: E_pc(z, z_mu) + s * E_hop(W, z).
 
-        The Hopfield attractor term E_hop = (1/2D) z^T (W^2 - W) z pulls z
+        The Hopfield attractor term E_hop = (1/2D) (||W^T z||^2 - z^T W z) pulls z
         toward stored patterns (attractors in z-space). Combined with the PC
         energy (which pulls z toward the upstream prediction mu), the
         equilibrium z* is the PC-optimal compromise between top-down
         expectation and internal memory prior. It reads ``state.z_latent``
         here — the z_latent-dependent-term rule — so both solver directions
         evaluate it at the same latent as the PC term. The gradient
-        dE_hop/dz = (s/D)(W^2 - W)z arrives via autodiff.
+        dE_hop/dz = (s/D)(W W^T - (W + W^T)/2) z arrives via autodiff; this is
+        (s/D)(W^2 - W) z only when W is symmetric (the default).
+
+        Returns per-sample energy of shape (batch,). E_hop is reduced over
+        every non-batch axis (e.g. both T and D for (batch, T, D) latents),
+        matching the base energy functionals.
 
         aux is None on the in_degree == 0 path: predict() never runs there
         and the param initializer assigns no W to source nodes (the memory
@@ -487,7 +497,10 @@ class StorkeyHopfield(NodeBase):
         energy = NodeBase.energy(params, inputs, state, aux, node_info)
 
         z = state.z_latent  # (batch, ..., D)
-        wz = z @ W  # (batch, ..., D)
+        wz = z @ W  # (batch, ..., D); row-vector form of W^T z
         D = z.shape[-1]
-        E_hopfield = (0.5 / D) * jnp.sum(wz * (wz - z), axis=-1)  # (1/2D) z^T(W^2-W)z
+        # Reduce over ALL non-batch axes so the result is (batch,), like the
+        # base energy. (1/2D)(||W^T z||^2 - z^T W z), summed over (T, D).
+        axes = tuple(range(1, z.ndim))
+        E_hopfield = (0.5 / D) * jnp.sum(wz * (wz - z), axis=axes)
         return energy + strength * E_hopfield
