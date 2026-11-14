@@ -207,8 +207,8 @@ def _get_learned_strength(params, structure):
     """Extract the effective hopfield_strength from trained params."""
     for node_name, node_params in params.nodes.items():
         if "hopfield_strength" in node_params.biases:
-            raw = node_params.biases["hopfield_strength"]
-            return float(jax.nn.softplus(raw))
+            config = structure.nodes[node_name].node_info.node_config
+            return float(StorkeyHopfield.effective_strength(node_params, config))
     return None
 
 
@@ -533,10 +533,7 @@ def diagnostic_inference_step(params, state, clamps, structure, config):
     node_config = structure.nodes[hop_node_name].node_info.node_config
     W = StorkeyHopfield._prepare_W(W_raw, node_config)
 
-    if "hopfield_strength" in hop_params.biases:
-        strength = float(jax.nn.softplus(hop_params.biases["hopfield_strength"]))
-    else:
-        strength = node_config.get("hopfield_strength", 1.0)
+    strength = float(StorkeyHopfield.effective_strength(hop_params, node_config))
 
     z = hop_state.z_latent
     D = z.shape[-1]

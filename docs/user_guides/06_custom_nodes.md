@@ -315,7 +315,7 @@ def energy(params, inputs, state, aux, node_info):
     z = state.z_latent                     # read the latent HERE, not via aux
     wz = z @ W
     D = z.shape[-1]
-    E_hopfield = (0.5 / D) * jnp.sum(wz * (wz - z), axis=-1)
+    E_hopfield = (0.5 / D) * jnp.sum(wz * (wz - z), axis=tuple(range(1, z.ndim)))
     return energy + strength * E_hopfield
 ```
 
