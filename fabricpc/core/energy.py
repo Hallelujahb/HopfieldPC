@@ -38,6 +38,7 @@ Energy functionals are instantiated with their parameters:
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, Sequence, Tuple
 
+import jax
 import jax.numpy as jnp
 
 from fabricpc.core._frozen import FrozenConfig
@@ -137,6 +138,22 @@ class EnergyFunctional(FrozenConfig, ABC):
 # =============================================================================
 
 
+def _log_floor(x, eps):
+    """log(max(x, eps)) in value, with the gradient of log(x).
+
+    A plain clip passes no gradient below eps, so a prediction under eps (a
+    softmax true-class probability under 1e-7, a logit gap near 16) sent no
+    learning signal. Here the value is floored as before, while the gradient
+    is 1 / x down to the smallest normal float, below which it is cut to zero
+    so 1 / x cannot overflow. The product with a softmax or sigmoid Jacobian
+    then stays finite and equals the gradient of the log-softmax loss.
+    """
+    tiny = jnp.finfo(x.dtype).tiny
+    exact = jnp.log(jnp.maximum(x, tiny))
+    floored = jnp.log(jnp.maximum(x, eps))
+    return exact + jax.lax.stop_gradient(floored - exact)
+
+
 class GaussianEnergy(EnergyFunctional):
     """
     Gaussian (quadratic) energy functional.
@@ -205,9 +222,11 @@ class BernoulliEnergy(EnergyFunctional):
         Compute Bernoulli (BCE) energy: E = -sum[z*log(mu) + (1-z)*log(1-mu)]
         """
         eps = config.get("eps", 1e-7) if config else 1e-7
-        z_mu_safe = jnp.clip(z_mu, eps, 1 - eps)
 
-        bce = -(z_latent * jnp.log(z_mu_safe) + (1 - z_latent) * jnp.log(1 - z_mu_safe))
+        bce = -(
+            z_latent * _log_floor(z_mu, eps)
+            + (1 - z_latent) * _log_floor(1 - z_mu, eps)
+        )
 
         # Sum over all non-batch dimensions
         axes_to_sum = tuple(range(1, len(bce.shape)))
@@ -257,9 +276,8 @@ class CrossEntropyEnergy(EnergyFunctional):
         Compute cross_entropy (CE) energy: E = -sum z_i * log(mu_i)
         """
         eps = config.get("eps", 1e-7) if config else 1e-7
-        z_mu_safe = jnp.clip(z_mu, eps, 1.0)
 
-        ce = -z_latent * jnp.log(z_mu_safe)
+        ce = -z_latent * _log_floor(jnp.minimum(z_mu, 1.0), eps)
 
         # Sum over all non-batch dimensions
         axes_to_sum = tuple(range(1, len(ce.shape)))
@@ -413,11 +431,11 @@ class KLDivergenceEnergy(EnergyFunctional):
 
         # Clip for numerical stability
         z_latent_safe = jnp.clip(z_latent, eps, 1.0)
-        z_mu_safe = jnp.clip(z_mu, eps, 1.0)
+        log_mu = _log_floor(jnp.minimum(z_mu, 1.0), eps)
 
         # KL divergence: z * log(z) - z * log(mu)
         # Note: z * log(z) term handles the case where z -> 0 (gives 0, not -inf)
-        kl = z_latent_safe * (jnp.log(z_latent_safe) - jnp.log(z_mu_safe))
+        kl = z_latent_safe * (jnp.log(z_latent_safe) - log_mu)
 
         # Handle z = 0 case: 0 * log(0) should be 0, not nan
         kl = jnp.where(z_latent < eps, 0.0, kl)
